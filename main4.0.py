@@ -206,38 +206,6 @@ def subsample_points_np(points: np.ndarray, max_points: int) -> np.ndarray:
 
 
 # =========================================================
-# 1.5) Only allow proper rotations (det = +1)
-# =========================================================
-def perm_parity(perm):
-    inv = 0
-    p = list(perm)
-    for i in range(len(p)):
-        for j in range(i + 1, len(p)):
-            if p[i] > p[j]:
-                inv += 1
-    return 1 if inv % 2 == 0 else -1
-
-
-def transform_det_sign(perm, sign):
-    return perm_parity(perm) * int(np.prod(np.array(sign, dtype=np.int32)))
-
-
-def generate_proper_rotation_transforms():
-    """
-    只保留 det = +1 的变换，也就是真正旋转。
-    去掉镜像反射解。
-    """
-    transforms = []
-    perms = list(itertools.permutations([0, 1, 2]))
-    signs = list(itertools.product([1, -1], repeat=3))
-    for perm in perms:
-        for sign in signs:
-            if transform_det_sign(perm, sign) == 1:
-                transforms.append((perm, sign))
-    return transforms
-
-
-# =========================================================
 # 2) Camera
 # =========================================================
 def load_camera_for_maskrs(scene_cam_path, H_mask, W_mask):
@@ -358,7 +326,7 @@ def mask_iou(a, b):
 
 
 # =========================================================
-# 4) Placement search + anti-flip + manual override
+# 4) Placement search
 # =========================================================
 def make_search_levels(base_scale, diag):
     coarse = {
@@ -385,54 +353,7 @@ def make_search_levels(base_scale, diag):
     return coarse, fine
 
 
-def visible_cd_to_anchor(pred_points_cam, anchor_pts, K, gt_mask_shape, voxel_size=0.02):
-    H, W = gt_mask_shape
-    uv, depth, valid_idx = project_camera_points(K, pred_points_cam)
-
-    pred_mask, keep_local = render_visible_mask_fast(
-        uv, depth, H, W,
-        point_radius=4,
-        dilate_iter=2,
-        close_iter=2,
-        use_convex_hull=True,
-    )
-
-    keep_global = np.zeros((pred_points_cam.shape[0],), dtype=bool)
-    if len(valid_idx) > 0 and len(keep_local) > 0:
-        keep_global[valid_idx[keep_local]] = True
-
-    visible_pts = pred_points_cam[keep_global]
-    if len(visible_pts) < 20:
-        visible_pts = pred_points_cam
-
-    pred_ds = voxel_downsample_np(visible_pts, voxel_size)
-    anchor_ds = voxel_downsample_np(anchor_pts, voxel_size)
-
-    cd = robust_chamfer_distance_np(pred_ds, anchor_ds, trim_ratio=0.90)
-    return cd
-
-
-def apply_flip_mode(points_local, flip_mode="none"):
-    pts = points_local.copy()
-
-    if flip_mode == "none":
-        return pts
-    elif flip_mode == "rx180":
-        pts[:, 1] *= -1
-        pts[:, 2] *= -1
-    elif flip_mode == "rz180":
-        pts[:, 0] *= -1
-        pts[:, 1] *= -1
-    elif flip_mode == "rx180_rz180":
-        pts[:, 0] *= -1
-        pts[:, 2] *= -1
-    else:
-        raise ValueError(f"Unknown flip_mode: {flip_mode}")
-
-    return pts
-
-
-def score_candidate(local_centered, anchor_center, anchor_pts, gt_mask, K, diag, cand, render_cfg):
+def score_candidate(local_centered, anchor_center, gt_mask, K, diag, cand, render_cfg):
     X = apply_transform_local_to_camera(
         local_centered,
         scale=cand["scale"],
@@ -449,119 +370,59 @@ def score_candidate(local_centered, anchor_center, anchor_pts, gt_mask, K, diag,
         close_iter=render_cfg["close_iter"],
         use_convex_hull=render_cfg["use_convex_hull"],
     )
-
     iou = mask_iou(pred_mask, gt_mask)
     offset_penalty = np.linalg.norm(cand["trans"] - anchor_center) / max(diag, 1e-9)
     scale_penalty = abs(cand["scale"] / max(cand["base_scale"], 1e-9) - 1.0)
-
-    cd = visible_cd_to_anchor(
-        pred_points_cam=X,
-        anchor_pts=anchor_pts,
-        K=K,
-        gt_mask_shape=gt_mask.shape,
-        voxel_size=0.02,
-    )
-    cd_norm = cd / max(diag * diag, 1e-9)
-
-    score = (
-        iou
-        - 0.05 * offset_penalty
-        - 0.02 * scale_penalty
-        - 0.20 * cd_norm
-    )
-
+    score = iou - 0.05 * offset_penalty - 0.02 * scale_penalty
     return {
         "score": float(score),
         "iou": float(iou),
-        "cd": float(cd),
-        "cd_norm": float(cd_norm),
         "visible_keep": visible_keep,
         "pred_mask": pred_mask,
     }
 
 
-def evaluate_flip_candidate(local_centered_full, anchor_pts, gt_mask, K, diag, best_pose, flip_mode):
-    local_flip = apply_flip_mode(local_centered_full, flip_mode=flip_mode)
-
-    X_try = apply_transform_local_to_camera(
-        local_flip,
-        scale=best_pose["scale"],
-        trans=best_pose["trans"],
-        perm=best_pose["perm"],
-        sign=best_pose["sign"],
-        yaw_deg=best_pose["yaw_deg"],
-    )
-
-    uv, depth, _ = project_camera_points(K, X_try)
-    pred_mask, _ = render_visible_mask_fast(
-        uv, depth, gt_mask.shape[0], gt_mask.shape[1],
-        point_radius=4,
-        dilate_iter=2,
-        close_iter=2,
-        use_convex_hull=True,
-    )
-    iou = mask_iou(pred_mask, gt_mask)
-
-    cd = visible_cd_to_anchor(
-        pred_points_cam=X_try,
-        anchor_pts=anchor_pts,
-        K=K,
-        gt_mask_shape=gt_mask.shape,
-        voxel_size=0.02,
-    )
-    cd_norm = cd / max(diag * diag, 1e-9)
-
-    score = iou - 0.20 * cd_norm
-
-    return {
-        "flip_mode": flip_mode,
-        "points_cam": X_try,
-        "iou": float(iou),
-        "cd": float(cd),
-        "score": float(score),
-    }
-
-
-def place_one_object_optimized(local_pts, anchor_pts, gt_mask, K, search_points_limit=3000, manual_override=None):
+def place_one_object_optimized(local_pts, anchor_pts, gt_mask, K, search_points_limit=3000):
     local_center, local_extent = bbox_center_extent(local_pts)
     local_centered_full = local_pts - local_center[None, :]
-
     local_centered_search = subsample_points_np(local_centered_full, search_points_limit)
+
     anchor_center, anchor_extent = bbox_center_extent(anchor_pts)
     base_scale = float(np.median((anchor_extent + 1e-9) / (local_extent + 1e-9)))
     diag = float(np.linalg.norm(anchor_extent) + 1e-9)
 
-    rot_transforms = generate_proper_rotation_transforms()
+    perms = list(itertools.permutations([0, 1, 2]))
+    signs = list(itertools.product([1, -1], repeat=3))
     coarse_cfg, fine_cfg = make_search_levels(base_scale, diag)
 
     coarse_results = []
-    for perm, sign in rot_transforms:
-        for yaw_deg in coarse_cfg["yaw_candidates"]:
-            for sm in coarse_cfg["scale_muls"]:
-                scale = base_scale * sm
-                for fx in coarse_cfg["offset_fracs_xy"]:
-                    for fy in coarse_cfg["offset_fracs_xy"]:
-                        for fz in coarse_cfg["offset_fracs_z"]:
-                            cand = {
-                                "perm": perm,
-                                "sign": sign,
-                                "yaw_deg": float(yaw_deg),
-                                "scale": float(scale),
-                                "base_scale": float(base_scale),
-                                "trans": anchor_center + diag * np.array([fx, fy, fz], dtype=np.float64),
-                            }
-                            res = score_candidate(
-                                local_centered_search,
-                                anchor_center,
-                                anchor_pts,
-                                gt_mask,
-                                K,
-                                diag,
-                                cand,
-                                coarse_cfg,
-                            )
-                            cand.update(res)
-                            coarse_results.append(cand)
+    for perm in perms:
+        for sign in signs:
+            for yaw_deg in coarse_cfg["yaw_candidates"]:
+                for sm in coarse_cfg["scale_muls"]:
+                    scale = base_scale * sm
+                    for fx in coarse_cfg["offset_fracs_xy"]:
+                        for fy in coarse_cfg["offset_fracs_xy"]:
+                            for fz in coarse_cfg["offset_fracs_z"]:
+                                cand = {
+                                    "perm": perm,
+                                    "sign": sign,
+                                    "yaw_deg": float(yaw_deg),
+                                    "scale": float(scale),
+                                    "base_scale": float(base_scale),
+                                    "trans": anchor_center + diag * np.array([fx, fy, fz], dtype=np.float64),
+                                }
+                                res = score_candidate(
+                                    local_centered_search,
+                                    anchor_center,
+                                    gt_mask,
+                                    K,
+                                    diag,
+                                    cand,
+                                    coarse_cfg,
+                                )
+                                cand.update(res)
+                                coarse_results.append(cand)
 
     coarse_results.sort(key=lambda x: x["score"], reverse=True)
     coarse_results = coarse_results[:coarse_cfg["topk"]]
@@ -587,7 +448,6 @@ def place_one_object_optimized(local_pts, anchor_pts, gt_mask, K, search_points_
                             res = score_candidate(
                                 local_centered_search,
                                 anchor_center,
-                                anchor_pts,
                                 gt_mask,
                                 K,
                                 diag,
@@ -598,47 +458,15 @@ def place_one_object_optimized(local_pts, anchor_pts, gt_mask, K, search_points_
                             if best is None or cand["score"] > best["score"]:
                                 best = cand
 
-    # ---------- 自动翻转修正 ----------
-    flip_modes = ["none", "rx180", "rz180", "rx180_rz180"]
-    best_flip = None
-
-    for flip_mode in flip_modes:
-        cand = evaluate_flip_candidate(
-            local_centered_full=local_centered_full,
-            anchor_pts=anchor_pts,
-            gt_mask=gt_mask,
-            K=K,
-            diag=diag,
-            best_pose=best,
-            flip_mode=flip_mode,
-        )
-        if best_flip is None or cand["score"] > best_flip["score"]:
-            best_flip = cand
-
-    final_flip = best_flip
-    final_source = "auto"
-
-    # ---------- 人工强制覆盖 ----------
-    if manual_override is not None:
-        manual_flip_mode = manual_override.get("flip_mode", None)
-        if manual_flip_mode is not None:
-            final_flip = evaluate_flip_candidate(
-                local_centered_full=local_centered_full,
-                anchor_pts=anchor_pts,
-                gt_mask=gt_mask,
-                K=K,
-                diag=diag,
-                best_pose=best,
-                flip_mode=manual_flip_mode,
-            )
-            final_source = "manual"
-
-    best["flip_mode"] = final_flip["flip_mode"]
-    best["flip_iou"] = final_flip["iou"]
-    best["flip_cd"] = final_flip["cd"]
-    best["flip_score"] = final_flip["score"]
-    best["flip_source"] = final_source
-    best["points_cam"] = final_flip["points_cam"]
+    X_final = apply_transform_local_to_camera(
+        local_centered_full,
+        scale=best["scale"],
+        trans=best["trans"],
+        perm=best["perm"],
+        sign=best["sign"],
+        yaw_deg=best["yaw_deg"],
+    )
+    best["points_cam"] = X_final
     return best
 
 
@@ -760,7 +588,6 @@ def compose_scene_optimized(
     prepared_records,
     scene_cam_path,
     out_dir,
-    manual_object_overrides=None,
     voxel_size=0.02,
     fscore_threshold=0.05,
     search_points_limit=3000,
@@ -775,9 +602,6 @@ def compose_scene_optimized(
     merged = o3d.geometry.PointCloud()
     placement_logs = []
 
-    if manual_object_overrides is None:
-        manual_object_overrides = {}
-
     print("\n========== Compose Scene ==========")
 
     for rec in prepared_records:
@@ -786,15 +610,12 @@ def compose_scene_optimized(
         anchor_pts = rec["anchor_pts"]
         gt_mask = rec["gt_mask"]
 
-        manual_override = manual_object_overrides.get(oid, None)
-
         info = place_one_object_optimized(
             local_pts=local_pts,
             anchor_pts=anchor_pts,
             gt_mask=gt_mask,
             K=K,
             search_points_limit=search_points_limit,
-            manual_override=manual_override,
         )
         pts_cam = info["points_cam"]
 
@@ -810,26 +631,15 @@ def compose_scene_optimized(
             "object_id": int(oid),
             "perm": list(info["perm"]),
             "sign": list(info["sign"]),
-            "det_sign": int(transform_det_sign(info["perm"], info["sign"])),
             "yaw_deg": float(info["yaw_deg"]),
-            "flip_mode": info.get("flip_mode", "none"),
-            "flip_source": info.get("flip_source", "auto"),
             "placement_score": float(info["score"]),
             "placement_iou": float(info["iou"]),
-            "flip_iou": float(info.get("flip_iou", info["iou"])),
-            "flip_cd": float(info.get("flip_cd", 0.0)),
-            "flip_score": float(info.get("flip_score", info["score"])),
         })
 
         print(
             f"[OK] object_{oid:03d} "
-            f"perm={info['perm']} sign={info['sign']} "
-            f"det={transform_det_sign(info['perm'], info['sign'])} "
-            f"yaw={info['yaw_deg']:+.1f} "
-            f"flip={info.get('flip_mode', 'none')} "
-            f"source={info.get('flip_source', 'auto')} "
-            f"placement_IoU={info.get('flip_iou', info['iou']):.3f} "
-            f"CD={info.get('flip_cd', 0.0):.5f}"
+            f"perm={info['perm']} sign={info['sign']} yaw={info['yaw_deg']:+.1f} "
+            f"placement_IoU={info['iou']:.3f}"
         )
 
     merged_path = os.path.join(out_dir, "merged_aligned_scene.ply")
@@ -862,25 +672,6 @@ if __name__ == "__main__":
     SEARCH_POINTS_LIMIT = 3000
     USE_DBSCAN = True
 
-    # =====================================================
-    # 手动指定某个 object 强制翻转
-    #
-    # flip_mode 可选：
-    #   "none"
-    #   "rx180"         -> 上下翻 180°
-    #   "rz180"         -> 平面内转 180°
-    #   "rx180_rz180"
-    #
-    # 例子：
-    #   第4个物体（1-based）通常对应 object_id = 3
-    #   如果你想强制第4个物体上下翻 180°，就写：
-    # =====================================================
-    MANUAL_OBJECT_OVERRIDES = {
-        4: {"flip_mode": "rx180_rz180"},
-        # 如果你想改 object_004，就写：
-        # 4: {"flip_mode": "rx180"},
-    }
-
     ctx = build_records(
         sam3d_manifest_path=SAM3D_MANIFEST_PATH,
         anchor_meta_path=ANCHOR_META_PATH,
@@ -899,14 +690,12 @@ if __name__ == "__main__":
         prepared_records=prepared_records,
         scene_cam_path=SCENE_CAM_PATH,
         out_dir=OUT_DIR,
-        manual_object_overrides=MANUAL_OBJECT_OVERRIDES,
         voxel_size=VOXEL_SIZE,
         fscore_threshold=FSCORE_THRESHOLD,
         search_points_limit=SEARCH_POINTS_LIMIT,
     )
 
     metrics_out = {
-        "manual_object_overrides": MANUAL_OBJECT_OVERRIDES,
         "placement_logs": placement_logs,
         "evaluation": metrics,
         "merged_scene_path": merged_path,
